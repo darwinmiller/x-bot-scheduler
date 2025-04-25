@@ -6,11 +6,20 @@
 		"deploy": "wrangler deploy",
 		"dev": "wrangler dev",
 		"start": "wrangler dev",
-		"cf-typegen": "wrangler types"
+		"cf-typegen": "wrangler types",
+		"dev:env": "node dev.js",
+		"build": "wrangler build"
 	},
 	"devDependencies": {
 		"@cloudflare/workers-types": "^4.20250410.0",
 		"typescript": "^5.5.2",
 		"wrangler": "^4.10.0"
+	},
+	"dependencies": {
+		"@types/crypto-js": "^4.2.2",
+		"chalk": "^5.4.1",
+		"crypto-js": "^4.2.0",
+		"dotenv": "^16.5.0",
+		"twitter-bot-shared-lib": "../twitter-bot-shared-lib"
 	}
 }
