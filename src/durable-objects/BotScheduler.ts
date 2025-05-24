@@ -1,20 +1,12 @@
 import { DurableObject } from 'cloudflare:workers';
 import { TaskService } from 'twitter-bot-shared-lib';
 import { BotTaskDefinition, BotTaskExecution, TaskStatus } from 'twitter-bot-shared-lib';
-import { PullMentionsTaskHandler } from '../tasks/pullMentionsTask';
-import { ReplyTaskHandler } from '../tasks/replyTask';
-import { TaskHandler } from '../tasks/taskHandler';
 import { RateLimitService } from 'twitter-bot-shared-lib';
 import { RateLimitTrackingRepository } from 'twitter-bot-shared-lib';
 import { ApplicationSettingsRepository } from 'twitter-bot-shared-lib';
 import { Env } from '../types/env';
 import chalk from 'chalk';
-import { ReplyGenerationTaskHandler } from '../tasks/replyGenerationTask';
-const taskHandlers: TaskHandler[] = [
-    new PullMentionsTaskHandler(),
-    new ReplyTaskHandler(),
-    new ReplyGenerationTaskHandler()
-];
+import { initializeTaskHandlers, taskHandlers } from '../tasks/taskHandlers';
 
 /**
  * BotScheduler is a Durable Object that manages task scheduling and execution for a single bot.
@@ -46,6 +38,9 @@ export class BotScheduler extends DurableObject {
         const rateLimitRepo = new RateLimitTrackingRepository(env.DB);
         // Initialize rateLimitService with empty botId, will be set when botId is available
         this.rateLimitService = new RateLimitService(rateLimitRepo, 'basic', '');
+
+        // Initialize task handlers
+        initializeTaskHandlers(env);
 
         // Initialize state from storage
         ctx.blockConcurrencyWhile(async () => {
@@ -315,57 +310,56 @@ export class BotScheduler extends DurableObject {
 
         const botId = this.botId;
         if (!botId) {
-            console.log(chalk.red('❌ Alarm triggered but bot ID is not set'));
+            console.log(chalk.red('❌ [BotScheduler:Alarm] Alarm triggered but bot ID is not set'));
             return;
         }
 
         this.rateLimitService = new RateLimitService(new RateLimitTrackingRepository(this.env.DB), 'basic', botId);
         const workerId = crypto.randomUUID();
-        console.log(chalk.cyan(`🔔 Alarm triggered for bot ${botId}`));
+        console.log(chalk.cyan(`🔔 [BotScheduler:Alarm] Alarm triggered for bot ${botId}, workerId: ${workerId}`));
 
         try {
-            // Cleanup any expired locks first
+            console.log(chalk.blue(`🧹 [BotScheduler:Alarm] Attempting to cleanup expired locks for bot ${botId}`));
             await this.taskService.cleanupExpiredLocks();
+            console.log(chalk.blue(`✅ [BotScheduler:Alarm] Expired locks cleanup complete for bot ${botId}`));
 
-            // Get all due tasks for this bot
             const dueTasks = await this.taskService.getDueTasksByBot(botId, new Date());
-            console.log(chalk.blue(`📋 Found ${dueTasks.length} due tasks for bot ${botId}`));
+            console.log(chalk.blue(`📋 [BotScheduler:Alarm] Found ${dueTasks.length} due tasks for bot ${botId}:`), dueTasks.map(t => t.id));
 
-            // Process each task
             for (const task of dueTasks) {
-                console.log(chalk.cyan(`🔄 Processing task ${task.id} (${task.task_type}) for bot ${botId}`));
+                console.log(chalk.cyan(`🔄 [BotScheduler:Alarm] Processing task ${task.id} (${task.task_type}) for bot ${botId}`));
 
-                // Find appropriate handler
                 const handler = taskHandlers.find(h => h.canHandle(task));
                 if (!handler) {
-                    console.log(chalk.red(`❌ No handler found for task type ${task.task_type}`));
+                    console.log(chalk.red(`❌ [BotScheduler:Alarm] No handler found for task type ${task.task_type} (task ID: ${task.id})`));
                     continue;
                 }
 
-                // Try to acquire lock
+                console.log(chalk.blue(`🔐 [BotScheduler:Alarm] Attempting to acquire lock for task ${task.id}`));
                 if (!(await this.taskService.acquireTaskLock(task.id, workerId, 5))) {
-                    console.log(chalk.yellow(`⚠️ Could not acquire lock for task ${task.id}`));
+                    console.log(chalk.yellow(`⚠️ [BotScheduler:Alarm] Could not acquire lock for task ${task.id}`));
                     continue;
                 }
+                console.log(chalk.blue(`✅ [BotScheduler:Alarm] Lock acquired for task ${task.id}`));
 
                 let execution: BotTaskExecution | null = null;
                 try {
-                    // Get current rate limit stats if endpoint is specified
                     let rateLimitRemaining = 0;
                     if (task.rate_limit_endpoint) {
+                        console.log(chalk.blue(`📊 [BotScheduler:Alarm] Getting initial rate limit stats for task ${task.id}, endpoint: ${task.rate_limit_endpoint}`));
                         const stats = await this.rateLimitService.getUsageStats(task.rate_limit_endpoint);
                         rateLimitRemaining = stats.limit - stats.current;
+                        console.log(chalk.blue(`📊 [BotScheduler:Alarm] Initial rate limit for task ${task.id}: ${rateLimitRemaining}`));
                     }
 
-                    // Create execution
-                    execution = await this.taskService.createTaskExecution({
+                    const executionData = {
                         bot_id: botId,
                         task_definition_id: task.id,
                         status: 'started' as TaskStatus,
                         started_at: new Date(),
                         completed_at: null,
                         duration_ms: 0,
-                        attempt_number: 1,
+                        attempt_number: 1, // Assuming this is the first attempt within this alarm
                         rate_limit_remaining: rateLimitRemaining,
                         worker_id: workerId,
                         is_locked: true,
@@ -373,111 +367,124 @@ export class BotScheduler extends DurableObject {
                         result_data: null,
                         error_message: null,
                         error_stack: null
-                    });
+                    };
+                    console.log(chalk.blue(`➕ [BotScheduler:Alarm] Creating execution record for task ${task.id} with data:`), executionData);
+                    execution = await this.taskService.createTaskExecution(executionData);
+                    console.log(chalk.blue(`✅ [BotScheduler:Alarm] Execution record ${execution.id} created for task ${task.id}`));
 
-                    // Execute task
+                    console.log(chalk.blue(`▶️ [BotScheduler:Alarm] Executing task ${task.id} via handler`));
                     await handler.execute(this.env, botId, task, execution, this.taskService);
+                    console.log(chalk.green(`✅ [BotScheduler:Alarm] Handler execution complete for task ${task.id}`));
 
-                    // Update execution status
                     if (execution) {
-                        // Get updated rate limit stats if endpoint is specified
                         let updatedRateLimitRemaining = 0;
                         if (task.rate_limit_endpoint) {
+                            console.log(chalk.blue(`📊 [BotScheduler:Alarm] Getting updated rate limit stats for task ${task.id}, endpoint: ${task.rate_limit_endpoint}`));
                             const stats = await this.rateLimitService.getUsageStats(task.rate_limit_endpoint);
-                            console.log(chalk.blue(`🔄 Rate limit stats for task ${task.id}:`, JSON.stringify(stats)));
+
                             updatedRateLimitRemaining = stats.limit - stats.current;
+                            console.log(chalk.blue(`📊 [BotScheduler:Alarm] Updated rate limit for task ${task.id}: ${updatedRateLimitRemaining}`));
                         }
 
                         const startedAt = new Date(execution.started_at);
-                        await this.taskService.updateTaskExecution(execution.id, {
+                        const updateExecutionData = {
                             status: 'completed' as TaskStatus,
                             completed_at: new Date(),
                             duration_ms: Date.now() - startedAt.getTime(),
                             rate_limit_remaining: updatedRateLimitRemaining,
                             is_locked: false,
                             lock_expires_at: null
-                        });
+                        };
+                        console.log(chalk.blue(`💾 [BotScheduler:Alarm] Updating execution ${execution.id} for task ${task.id} to completed with data:`), updateExecutionData);
+                        await this.taskService.updateTaskExecution(execution.id, updateExecutionData);
+                        console.log(chalk.blue(`✅ [BotScheduler:Alarm] Execution ${execution.id} updated for task ${task.id}`));
 
-                        // Update task definition with successful run
-                        await this.taskService.updateTaskDefinition(task.id, {
+                        const updateTaskDefData = {
                             last_successful_run_at: new Date(),
                             next_planned_run_at: new Date(Date.now() + task.interval_minutes * 60 * 1000)
-                        });
+                        };
+                        console.log(chalk.blue(`💾 [BotScheduler:Alarm] Updating task definition ${task.id} with data:`), updateTaskDefData);
+                        await this.taskService.updateTaskDefinition(task.id, updateTaskDefData);
+                        console.log(chalk.blue(`✅ [BotScheduler:Alarm] Task definition ${task.id} updated`));
                     }
 
-                    console.log(chalk.green(`✅ Successfully completed task ${task.id}`));
+                    console.log(chalk.green(`🏁 [BotScheduler:Alarm] Successfully completed processing for task ${task.id}`));
                 } catch (error) {
-                    console.log(chalk.red(`❌ Error processing task ${task.id}:`), error);
+                    console.log(chalk.red(`❌ [BotScheduler:Alarm] Error processing task ${task.id} (execution ID: ${execution?.id}):`), error);
 
                     if (execution) {
-                        // Get current rate limit stats if endpoint is specified
-                        let rateLimitRemaining = 0;
+                        let rateLimitRemainingOnError = 0;
                         if (task.rate_limit_endpoint) {
+                            console.log(chalk.blue(`📊 [BotScheduler:Alarm] Getting rate limit stats on error for task ${task.id}, endpoint: ${task.rate_limit_endpoint}`));
                             const stats = await this.rateLimitService.getUsageStats(task.rate_limit_endpoint);
-                            rateLimitRemaining = stats.limit - stats.current;
+                            rateLimitRemainingOnError = stats.limit - stats.current;
+                            console.log(chalk.blue(`📊 [BotScheduler:Alarm] Rate limit on error for task ${task.id}: ${rateLimitRemainingOnError}`));
                         }
 
-                        // Check if we should retry
-                        if (execution.attempt_number < (task.max_retries || 3)) {
-                            // Calculate retry delay (default to 5 minutes if not specified)
+                        // Ensure attempt_number is accurate if retrying from a previous execution
+                        // This part of the logic might need refinement if alarms re-process tasks already in 'retrying' state.
+                        // For now, assuming execution.attempt_number is correctly set by createTaskExecution or fetched if task was already 'retrying'.
+                        const currentAttempt = execution.attempt_number || 1;
+
+                        if (currentAttempt < (task.max_retries || 3)) {
                             const retryDelayMinutes = task.retry_delay_minutes || 5;
                             const nextRetryTime = new Date(Date.now() + retryDelayMinutes * 60 * 1000);
-
-                            const startedAt = new Date(execution.started_at);
-                            // Update execution status to retrying
-                            await this.taskService.updateTaskExecution(execution.id, {
+                            const errorUpdateExecutionData = {
                                 status: 'retrying' as TaskStatus,
                                 completed_at: new Date(),
-                                duration_ms: Date.now() - startedAt.getTime(),
-                                rate_limit_remaining: rateLimitRemaining,
+                                duration_ms: Date.now() - new Date(execution.started_at).getTime(),
+                                rate_limit_remaining: rateLimitRemainingOnError,
                                 is_locked: false,
                                 lock_expires_at: null,
                                 error_message: error instanceof Error ? error.message : String(error),
-                                error_stack: error instanceof Error ? error.stack || null : null
-                            });
+                                error_stack: error instanceof Error ? error.stack || null : null,
+                                attempt_number: currentAttempt + 1 // Increment attempt number
+                            };
+                            console.log(chalk.yellow(`🔄 [BotScheduler:Alarm] Updating execution ${execution.id} for task ${task.id} to retrying with data:`), errorUpdateExecutionData);
+                            await this.taskService.updateTaskExecution(execution.id, errorUpdateExecutionData);
 
-                            // Update task definition with retry time
-                            await this.taskService.updateTaskDefinition(task.id, {
-                                next_planned_run_at: nextRetryTime
-                            });
-
-                            console.log(chalk.yellow(`🔄 Task ${task.id} will retry at ${nextRetryTime.toISOString()}`));
+                            const retryTaskDefData = { next_planned_run_at: nextRetryTime };
+                            console.log(chalk.yellow(`🔄 [BotScheduler:Alarm] Updating task definition ${task.id} for retry with data:`), retryTaskDefData);
+                            await this.taskService.updateTaskDefinition(task.id, retryTaskDefData);
+                            console.log(chalk.yellow(`⏳ [BotScheduler:Alarm] Task ${task.id} will retry at ${nextRetryTime.toISOString()}`));
                         } else {
-                            // Max retries exceeded, mark as failed
-                            const startedAt = new Date(execution.started_at);
-                            await this.taskService.updateTaskExecution(execution.id, {
+                            const failUpdateExecutionData = {
                                 status: 'failed' as TaskStatus,
                                 completed_at: new Date(),
-                                duration_ms: Date.now() - startedAt.getTime(),
-                                rate_limit_remaining: rateLimitRemaining,
+                                duration_ms: Date.now() - new Date(execution.started_at).getTime(),
+                                rate_limit_remaining: rateLimitRemainingOnError,
                                 is_locked: false,
                                 lock_expires_at: null,
                                 error_message: error instanceof Error ? error.message : String(error),
                                 error_stack: error instanceof Error ? error.stack || null : null
-                            });
+                            };
+                            console.log(chalk.red(`🛑 [BotScheduler:Alarm] Updating execution ${execution.id} for task ${task.id} to failed with data:`), failUpdateExecutionData);
+                            await this.taskService.updateTaskExecution(execution.id, failUpdateExecutionData);
 
-                            // Check if we should pause the task due to error threshold
                             if (task.error_threshold) {
+                                console.log(chalk.blue(`📉 [BotScheduler:Alarm] Checking error threshold for task ${task.id} (threshold: ${task.error_threshold})`));
                                 const recentFailures = await this.taskService.getFailedTaskExecutionsByBot(botId, task.error_threshold);
-                                if (recentFailures.length >= task.error_threshold) {
-                                    await this.taskService.updateTaskDefinition(task.id, {
-                                        is_active: false
-                                    });
-                                    console.log(chalk.red(`⏸️ Task ${task.id} paused due to exceeding error threshold`));
+                                console.log(chalk.blue(`📉 [BotScheduler:Alarm] Found ${recentFailures.length} recent failures for bot ${botId}`));
+                                if (recentFailures.filter(f => f.task_definition_id === task.id).length >= task.error_threshold) {
+                                    console.log(chalk.red(`⏸️ [BotScheduler:Alarm] Pausing task ${task.id} due to exceeding error threshold.`));
+                                    await this.taskService.updateTaskDefinition(task.id, { is_active: false });
                                 }
                             }
+                            console.log(chalk.red(`🛑 [BotScheduler:Alarm] Task ${task.id} marked as failed after max retries.`));
                         }
                     }
                 } finally {
-                    // Always release the lock
+                    console.log(chalk.blue(`🔓 [BotScheduler:Alarm] Releasing lock for task ${task.id}`));
                     await this.taskService.releaseTaskLock(task.id);
+                    console.log(chalk.blue(`✅ [BotScheduler:Alarm] Lock released for task ${task.id}`));
                 }
             }
         } catch (error) {
-            console.log(chalk.red('❌ Error in alarm handler:'), error);
+            console.log(chalk.red('❌ [BotScheduler:Alarm] Unhandled error in alarm handler main try-catch:'), error);
         } finally {
-            // Schedule the next alarm
+            console.log(chalk.blue(`⏭️ [BotScheduler:Alarm] Scheduling next alarm for bot ${botId}`));
             await this.scheduleNextAlarm();
+            console.log(chalk.blue(`✅ [BotScheduler:Alarm] Next alarm scheduling attempt complete for bot ${botId}`));
         }
     }
 }

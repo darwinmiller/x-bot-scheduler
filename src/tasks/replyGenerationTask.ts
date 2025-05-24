@@ -6,6 +6,10 @@ import chalk from 'chalk';
 export interface ReplyGenerationTaskConfig {
     llm_config_id: string;
     prompt_id: string;
+    vision_config?: {
+        vision_llm_config_id: string;
+        vision_prompt_id: string;
+    };
 }
 
 export class ReplyGenerationTaskHandler extends BaseTaskHandler {
@@ -73,30 +77,66 @@ export class ReplyGenerationTaskHandler extends BaseTaskHandler {
                     // Get the pulled post this reply is associated with
                     const pulledPost = await pulledPostRepository.findById(reply.pulled_post_id);
 
-
                     if (!pulledPost) {
                         console.error(chalk.red(`❌ Pulled post not found for reply ${reply.id}`));
+                        errorCount++; // Increment error count for this specific failure
                         continue;
                     }
-                    // Get the twitter user this reply is associated with
+
+                    // Fetch the Twitter user who authored the pulledPost
                     if (!pulledPost.author_id) {
-                        console.error(chalk.red(`❌ Pulled post author ID not found for reply ${reply.id}`));
+                        console.error(chalk.red(`❌ Author ID not found on pulled post ${pulledPost.id} for reply ${reply.id}`));
+                        errorCount++;
                         continue;
                     }
-                    const twitterUser = await twitterUserService.findUserById(pulledPost.author_id);
+                    const twitterUser = await twitterUserService.findUserByTwitterId(pulledPost.author_id);
+
+                    if (!twitterUser) {
+                        console.error(chalk.red(`❌ Twitter user not found for author ID ${pulledPost.author_id} (pulled post ${pulledPost.id})`));
+                        errorCount++;
+                        continue;
+                    }
+
+                    // Check if the user is banned
+                    if (twitterUser.banned_at) {
+                        console.log(chalk.yellow(`🚫 User ${twitterUser.username} (ID: ${twitterUser.twitter_id}) is banned. Skipping reply generation for reply ${reply.id}.`));
+                        await postReplyRepository.update(reply.id, {
+                            status: 'rejected', // Assuming 'rejected' is a valid status
+                            updated_by: 'bot_' + botId,
+                            error_message: `Author ${twitterUser.username} (ID: ${twitterUser.twitter_id}) is banned.`
+                        });
+                        // Not incrementing successCount as no reply was generated.
+                        // Not incrementing errorCount unless we consider this an error in the task itself.
+                        // For now, this is a successful handling of a banned user.
+                        continue;
+                    }
+
+                    // Twitter user for the pulledPost is fetched inside LLMService now
+                    // Conversation lineage is also fetched and formatted inside LLMService
 
                     if (typeof task.config.llm_config_id !== 'string' || typeof task.config.prompt_id !== 'string') {
                         console.error(chalk.red(`❌ LLM config or prompt ID not found for reply ${reply.id}`));
                         continue;
                     }
 
+                    // Variables are now constructed within llmService.generate
+                    // const variables: Record<string, string> = {}
+                    // if (twitterUser) {
+                    //     variables.twitter_user_name = twitterUser.name;
+                    //     variables.twitter_user_handle = twitterUser.username;
+                    // }
+                    // if (pulledPost.reply_to_tweet_id) {
+                    //     const conversationLineage = await pulledPostRepository.getConversationLineage(pulledPost.twitter_post_id);
+                    //     variables.conversation_context = conversationLineage.map(post => `${post.author_username}: ${post.content}`).join('\n');
+                    // }
+
                     const result = await llmService.generate({
                         llm_config_id: task.config.llm_config_id,
                         prompt_id: task.config.prompt_id,
-                        prompt: pulledPost.content,
-                        variables: {},
+                        pulled_post_id: pulledPost.id, // Pass pulled_post_id
                         purpose: 'reply',
-                        reply_id: reply.id
+                        reply_id: reply.id,
+                        vision_config: task.config.vision_config as ReplyGenerationTaskConfig['vision_config']// Pass vision_config
                     }, 'bot_' + botId);
 
                     if (result.status === 'complete') {
@@ -105,11 +145,35 @@ export class ReplyGenerationTaskHandler extends BaseTaskHandler {
                             original_content: result.output,
                             updated_by: 'bot_' + botId
                         });
+                        successCount++; // Increment success count
+                    } else {
+                        // Handle cases where LLM generation itself might fail or return a non-complete status
+                        console.error(chalk.red(`❌ LLM generation failed for reply ${reply.id} with status: ${result.status}. LLM Output: ${result.output}`));
+                        //TODO: add a status of failed to the post_reply generation_status
+                        await postReplyRepository.update(reply.id, {
+                            generation_status: 'complete', // Or an appropriate error status
+                            updated_by: 'bot_' + botId,
+                            error_message: `LLM generation returned status: ${result.status}. Error: ${result.error_message || 'No error message'}`
+                        });
+                        errorCount++;
                     }
                 } catch (error) {
-                    console.error(`Error executing reply generation task ${task.id}:`, error);
+                    console.error(`Error processing reply ${reply.id} in task ${task.id}:`, error);
                     errorCount++;
-                    throw error;
+                    // Update the specific reply to a failed status to avoid reprocessing indefinitely
+                    try {
+                        //TODO: add a status of failed to the post_reply generation_status
+                        await postReplyRepository.update(reply.id, {
+                            generation_status: 'complete',
+                            updated_by: 'bot_' + botId,
+                            error_message: error instanceof Error ? `Outer catch: ${error.message}` : 'Outer catch: Unknown error during reply processing'
+                        });
+                    } catch (updateError) {
+                        console.error(`Error updating reply ${reply.id} to failed status:`, updateError);
+                    }
+                    // Continue to the next reply instead of throwing, to allow other replies to be processed.
+                    // If the entire task should fail on any single reply error, then re-throw the error.
+                    // For now, we log and continue.
                 }
             }
 
