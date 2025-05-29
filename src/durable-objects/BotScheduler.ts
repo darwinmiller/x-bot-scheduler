@@ -4,6 +4,7 @@ import { BotTaskDefinition, BotTaskExecution, TaskStatus } from 'twitter-bot-sha
 import { RateLimitService } from 'twitter-bot-shared-lib';
 import { RateLimitTrackingRepository } from 'twitter-bot-shared-lib';
 import { ApplicationSettingsRepository } from 'twitter-bot-shared-lib';
+import { WebSocketMessage, ConnectionAckMessage, LogMessage, EntityUpdateNotification, SchedulerStatusUpdateMessage } from 'twitter-bot-shared-lib';
 import { Env } from '../types/env';
 import chalk from 'chalk';
 import { initializeTaskHandlers, taskHandlers } from '../tasks/taskHandlers';
@@ -49,9 +50,52 @@ export class BotScheduler extends DurableObject {
                 this.botId = state.botId;
                 this.isRunning = state.isRunning;
                 this.currentAlarmTime = state.currentAlarmTime;
-                console.log(chalk.blue(`🔄 BotScheduler initialized for bot ${this.botId}`));
+                this.log('info', `🔄 BotScheduler (re)initialized for bot ${this.botId}`);
+                // Consider sending an initial status update if WebSockets could be connected before fetch sets botId
+                // However, botId is crucial for targeted messages, so usually it's fine after fetch.
+            } else {
+                // If state is null, it might be the first time. botId will be set in fetch.
+                // Avoid logging with this.botId here as it might be null.
+                console.log(chalk.blue(`🔄 BotScheduler first-time initialization or no stored state.`));
             }
         });
+    }
+
+    private broadcast(message: WebSocketMessage) {
+        if (!this.botId) return; // Don't broadcast if botId isn't set
+
+        const sockets = this.ctx.getWebSockets();
+        if (sockets.length > 0) {
+            const serializedMessage = JSON.stringify(message);
+            sockets.forEach(ws => {
+                try {
+                    ws.send(serializedMessage);
+                } catch (e) {
+                    console.error(chalk.red(`[Bot ${this.botId}] Failed to send to WebSocket:`), e);
+                }
+            });
+        }
+    }
+
+    public log(level: LogMessage['level'], content: string) {
+        // Ensure botId is available before logging via WebSocket
+        const currentBotId = this.botId || 'UNKNOWN_BOT';
+
+        const logMessage: LogMessage = {
+            type: 'log',
+            id: crypto.randomUUID(),
+            timestamp: Date.now(),
+            level,
+            content,
+            botId: currentBotId,
+        };
+        // Standard console logging (retains chalk for server-side visibility)
+        //console.log(chalk.magenta(`[WS LOG][Bot ${currentBotId}] [${level.toUpperCase()}] ${content}`));
+
+        // Broadcast only if botId is known (to avoid sending logs for uninitialized DOs if any client connects too early)
+        if (this.botId) {
+            this.broadcast(logMessage);
+        }
     }
 
     /**
@@ -65,12 +109,48 @@ export class BotScheduler extends DurableObject {
     async fetch(request: Request): Promise<Response> {
         const url = new URL(request.url);
         const path = url.pathname;
-        const [, botId, action] = path.match(/^\/bots\/([^\/]+)\/(start|stop|status)$/) || [];
 
-        console.log(chalk.cyan(`📡 BotScheduler request: ${path}`));
+        // Check for WebSocket upgrade request first
+        const upgradeHeader = request.headers.get('Upgrade');
+        if (upgradeHeader && upgradeHeader.toLowerCase() === 'websocket') {
+            if (!this.botId) {
+                // This case should ideally be prevented by the proxying worker ensuring botId is established first
+                console.log(chalk.red('❌ WebSocket connection denied: Bot ID not yet established for this Durable Object instance.'));
+                // No this.log here as botId isn't set reliably yet for a WebSocket-specific log message
+                return new Response('Bot ID not established. Cannot accept WebSocket.', { status: 400 });
+            }
 
-        if (!botId) {
+            const pair = new WebSocketPair();
+            const [client, server] = Object.values(pair);
+
+            await this.ctx.acceptWebSocket(server);
+
+            // Send an acknowledgment message including initial scheduler status
+            const ackMsg: ConnectionAckMessage = {
+                type: 'connection_ack',
+                message: `WebSocket connection established for bot ${this.botId}`,
+                botId: this.botId,
+                initialSchedulerStatus: {
+                    isRunning: this.isRunning,
+                    currentAlarmTime: this.currentAlarmTime,
+                }
+            };
+            server.send(JSON.stringify(ackMsg));
+
+            return new Response(null, {
+                status: 101, // Switching Protocols
+                webSocket: client,
+            });
+        }
+
+        // Existing HTTP endpoint logic
+        const [, botIdFromPath, action] = path.match(/^\/bots\/([^\/]+)\/(start|stop|status)$/) || [];
+
+        console.log(chalk.cyan(`📡 BotScheduler HTTP request: ${path}`));
+
+        if (!botIdFromPath) {
             console.log(chalk.red('❌ Bot ID is required'));
+            this.log('error', 'HTTP request received without Bot ID in path.');
             return new Response(JSON.stringify({ error: 'Bot ID is required' }), {
                 status: 400,
                 headers: { 'Content-Type': 'application/json' }
@@ -79,13 +159,16 @@ export class BotScheduler extends DurableObject {
 
         // Set the bot ID if not already set
         if (!this.botId) {
-            console.log(chalk.green(`✨ Setting bot ID for the first time: ${botId}`));
-            this.botId = botId;
-            await this.ctx.storage.put('state', { botId, isRunning: this.isRunning, currentAlarmTime: this.currentAlarmTime });
+            console.log(chalk.green(`✨ Setting bot ID for the first time: ${botIdFromPath}`));
+            this.botId = botIdFromPath;
+            await this.ctx.storage.put('state', { botId: this.botId!, isRunning: this.isRunning, currentAlarmTime: this.currentAlarmTime });
+            this.log('info', `✨ Bot ID set for the first time: ${this.botId}`);
+            this.notifySchedulerStatusUpdate(); // Notify status since botId is now set
         }
         // Verify the bot ID matches
-        else if (botId !== this.botId) {
-            console.log(chalk.red(`❌ Bot ID mismatch: requested ${botId}, stored ${this.botId}`));
+        else if (botIdFromPath !== this.botId) {
+            console.log(chalk.red(`❌ Bot ID mismatch: requested ${botIdFromPath}, stored ${this.botId}`));
+            this.log('error', `HTTP Bot ID mismatch: requested ${botIdFromPath}, stored ${this.botId}`);
             return new Response(JSON.stringify({ error: 'Bot ID mismatch' }), {
                 status: 400,
                 headers: { 'Content-Type': 'application/json' }
@@ -93,7 +176,7 @@ export class BotScheduler extends DurableObject {
         }
 
         // Initialize rate limit service with the correct botId
-        this.rateLimitService = new RateLimitService(new RateLimitTrackingRepository(this.env.DB), 'basic', botId);
+        this.rateLimitService = new RateLimitService(new RateLimitTrackingRepository(this.env.DB), 'basic', this.botId);
 
         switch (action) {
             case 'start':
@@ -104,6 +187,7 @@ export class BotScheduler extends DurableObject {
                 return this.handleStatus(request);
             default:
                 console.log(chalk.red(`❌ Unknown action: ${action}`));
+                this.log('error', `Unknown HTTP action received: ${action} for bot ${this.botId}`);
                 return new Response(JSON.stringify({ error: 'Not found' }), {
                     status: 404,
                     headers: { 'Content-Type': 'application/json' }
@@ -121,6 +205,7 @@ export class BotScheduler extends DurableObject {
     private async handleStart(request: Request): Promise<Response> {
         if (this.isRunning) {
             console.log(chalk.yellow(`⚠️ Scheduler is already running for bot ${this.botId}`));
+            this.log('warn', 'Start command received but scheduler already running.');
             return new Response(JSON.stringify({ error: 'Scheduler is already running' }), {
                 status: 400,
                 headers: { 'Content-Type': 'application/json' }
@@ -137,6 +222,8 @@ export class BotScheduler extends DurableObject {
             this.currentAlarmTime = null;
             await this.ctx.storage.put('state', { botId: this.botId!, isRunning: false, currentAlarmTime: null });
             console.log(chalk.yellow(`⚠️ No tasks to schedule for bot ${this.botId}`));
+            this.log('warn', 'Scheduler started but no tasks found, stopping immediately.');
+            this.notifySchedulerStatusUpdate(); // Notify status change
             return new Response(JSON.stringify({
                 message: 'No tasks to schedule',
                 isRunning: false
@@ -146,6 +233,8 @@ export class BotScheduler extends DurableObject {
         }
 
         console.log(chalk.green(`🚀 Started scheduler for bot ${this.botId}`));
+        this.log('info', 'Scheduler started successfully.');
+        this.notifySchedulerStatusUpdate();
         return new Response(JSON.stringify({
             message: 'Scheduler started',
             isRunning: true
@@ -163,6 +252,7 @@ export class BotScheduler extends DurableObject {
     private async handleStop(request: Request): Promise<Response> {
         if (!this.isRunning) {
             console.log(chalk.yellow(`⚠️ Scheduler is not running for bot ${this.botId}`));
+            this.log('warn', 'Stop command received but scheduler not running.');
             return new Response(JSON.stringify({ error: 'Scheduler is not running' }), {
                 status: 400,
                 headers: { 'Content-Type': 'application/json' }
@@ -174,6 +264,8 @@ export class BotScheduler extends DurableObject {
         await this.ctx.storage.put('state', { botId: this.botId!, isRunning: false, currentAlarmTime: null });
         await this.ctx.storage.deleteAlarm();
         console.log(chalk.green(`🛑 Stopped scheduler for bot ${this.botId}`));
+        this.log('info', 'Scheduler stopped successfully.');
+        this.notifySchedulerStatusUpdate(); // Notify status change
         return new Response(JSON.stringify({ message: 'Scheduler stopped' }), {
             headers: { 'Content-Type': 'application/json' }
         });
@@ -187,6 +279,8 @@ export class BotScheduler extends DurableObject {
      */
     private async handleStatus(request: Request): Promise<Response> {
         console.log(chalk.cyan(`📊 Status check for bot ${this.botId}`));
+        this.log('debug', 'Status check requested.');
+        let statusChanged = false; // Flag to check if we need to notify
 
         // If bot is running and we have a next alarm time, verify the alarm is actually set
         if (this.isRunning && this.currentAlarmTime) {
@@ -194,13 +288,33 @@ export class BotScheduler extends DurableObject {
                 const alarmTime = await this.ctx.storage.getAlarm();
                 if (!alarmTime) {
                     console.log(chalk.yellow(`⚠️ Alarm time exists (${new Date(this.currentAlarmTime).toISOString()}) but no alarm is set. Rescheduling...`));
-                    await this.scheduleNextAlarm();
+                    this.log('warn', 'Alarm time mismatch found during status check, attempting to reschedule.');
+                    const scheduled = await this.scheduleNextAlarm(); // This will update currentAlarmTime and persist
+                    if (scheduled) statusChanged = true;
+                } else if (alarmTime !== this.currentAlarmTime) {
+                    // This case indicates a potential desync between in-memory currentAlarmTime and stored alarm.
+                    // Trust the stored alarm and update in-memory state.
+                    this.log('warn', `In-memory currentAlarmTime (${this.currentAlarmTime}) differs from stored alarm (${alarmTime}). Syncing.`);
+                    this.currentAlarmTime = alarmTime;
+                    // No need to call storage.put for state here unless isRunning also changed, scheduleNextAlarm handles its own persistence of currentAlarmTime
+                    statusChanged = true;
                 }
             } catch (error) {
                 console.log(chalk.red(`❌ Error checking alarm status: ${error}`));
+                this.log('error', `Error during alarm status check: ${error instanceof Error ? error.message : String(error)}`);
                 // If we can't check the alarm status, try to reschedule anyway
-                await this.scheduleNextAlarm();
+                const scheduled = await this.scheduleNextAlarm(); // This will update currentAlarmTime and persist
+                if (scheduled) statusChanged = true;
             }
+        } else if (this.isRunning && !this.currentAlarmTime) {
+            // Scheduler is running but has no alarm time, implies it should try to schedule one.
+            this.log('warn', 'Scheduler is running but no alarm is set. Attempting to schedule.');
+            const scheduled = await this.scheduleNextAlarm();
+            if (scheduled) statusChanged = true;
+        }
+
+        if (statusChanged) {
+            this.notifySchedulerStatusUpdate();
         }
 
         return new Response(JSON.stringify({
@@ -224,11 +338,13 @@ export class BotScheduler extends DurableObject {
      */
     private async scheduleNextAlarm(): Promise<boolean> {
         if (!this.isRunning || !this.botId) return false;
+        this.log('debug', 'Attempting to schedule next alarm.');
 
         // Get active tasks for this bot using the stored bot ID
         const tasks = await this.taskService.getActiveTaskDefinitionsByBot(this.botId);
         if (tasks.length === 0) {
             console.log(chalk.yellow(`⚠️ No active tasks found for bot ${this.botId}`));
+            this.log('info', 'No active tasks found to schedule.');
             return false;
         }
 
@@ -240,7 +356,10 @@ export class BotScheduler extends DurableObject {
             // If task has a planned run time, use that
             if (task.next_planned_run_at) {
                 const taskTime = new Date(task.next_planned_run_at);
-                if (!earliest || taskTime < earliest) return taskTime;
+                if (!earliest || taskTime < earliest) {
+                    this.log('debug', `Task ${task.id} has a planned run time of ${taskTime.toISOString()}`);
+                    return taskTime;
+                }
                 console.log(chalk.blue(`⏰ Task ${task.id} has a planned run time of ${taskTime.toISOString()}`));
                 return earliest;
             }
@@ -258,6 +377,7 @@ export class BotScheduler extends DurableObject {
                     const nextRunTime = new Date(lastStartedAt.getTime() + intervalMs);
                     if (!earliest || nextRunTime < earliest) {
                         console.log(chalk.blue(`⏰ Task ${task.id} has a next run time of ${nextRunTime.toISOString()}`));
+                        this.log('debug', `Task ${task.id} (from history) next run time: ${nextRunTime.toISOString()}`);
                         return nextRunTime;
                     }
                 }
@@ -271,6 +391,7 @@ export class BotScheduler extends DurableObject {
             const nextRunTime = new Date(now.getTime() + (leadSeconds * 1000));
             if (!earliest || nextRunTime < earliest) {
                 console.log(chalk.blue(`⏰ Fresh task ${task.id} has a run time of ${nextRunTime.toISOString()}`));
+                this.log('debug', `Fresh task ${task.id} (lead time) next run time: ${nextRunTime.toISOString()}`);
                 return nextRunTime;
             }
 
@@ -279,15 +400,21 @@ export class BotScheduler extends DurableObject {
 
         if (!nextTask) {
             console.log(chalk.yellow(`⚠️ No tasks scheduled for bot ${this.botId}`));
+            this.log('info', 'No tasks found to schedule for an alarm.');
             return false;
         }
 
         // Schedule the alarm
         const alarmTime = nextTask.getTime();
+        const oldAlarmTime = this.currentAlarmTime;
         await this.ctx.storage.setAlarm(alarmTime);
         this.currentAlarmTime = alarmTime;
         await this.ctx.storage.put('state', { botId: this.botId!, isRunning: this.isRunning, currentAlarmTime: alarmTime });
         console.log(chalk.green(`⏰ Scheduled next alarm for bot ${this.botId} at ${new Date(alarmTime).toISOString()}`));
+        this.log('info', `Next alarm scheduled for ${new Date(alarmTime).toISOString()}`);
+        if (oldAlarmTime !== this.currentAlarmTime || !this.isRunning) { // also notify if isRunning changed implicitly by starting to run
+            this.notifySchedulerStatusUpdate();
+        }
         return true;
     }
 
@@ -311,36 +438,46 @@ export class BotScheduler extends DurableObject {
         const botId = this.botId;
         if (!botId) {
             console.log(chalk.red('❌ [BotScheduler:Alarm] Alarm triggered but bot ID is not set'));
+            // Cannot use this.log reliably here as botId is not set.
             return;
         }
 
         this.rateLimitService = new RateLimitService(new RateLimitTrackingRepository(this.env.DB), 'basic', botId);
         const workerId = crypto.randomUUID();
         console.log(chalk.cyan(`🔔 [BotScheduler:Alarm] Alarm triggered for bot ${botId}, workerId: ${workerId}`));
+        this.log('info', `Alarm triggered. Worker ID: ${workerId}`);
 
         try {
             console.log(chalk.blue(`🧹 [BotScheduler:Alarm] Attempting to cleanup expired locks for bot ${botId}`));
+            this.log('debug', 'Attempting to cleanup expired locks.');
             await this.taskService.cleanupExpiredLocks();
             console.log(chalk.blue(`✅ [BotScheduler:Alarm] Expired locks cleanup complete for bot ${botId}`));
+            this.log('debug', 'Expired locks cleanup complete.');
 
             const dueTasks = await this.taskService.getDueTasksByBot(botId, new Date());
             console.log(chalk.blue(`📋 [BotScheduler:Alarm] Found ${dueTasks.length} due tasks for bot ${botId}:`), dueTasks.map(t => t.id));
+            this.log('debug', `Found ${dueTasks.length} due tasks.`);
 
             for (const task of dueTasks) {
                 console.log(chalk.cyan(`🔄 [BotScheduler:Alarm] Processing task ${task.id} (${task.task_type}) for bot ${botId}`));
+                this.log('debug', `Processing task ${task.id} (${task.task_type})`);
 
                 const handler = taskHandlers.find(h => h.canHandle(task));
                 if (!handler) {
                     console.log(chalk.red(`❌ [BotScheduler:Alarm] No handler found for task type ${task.task_type} (task ID: ${task.id})`));
+                    this.log('error', `No handler found for task type ${task.task_type} (task ID: ${task.id})`);
                     continue;
                 }
 
                 console.log(chalk.blue(`🔐 [BotScheduler:Alarm] Attempting to acquire lock for task ${task.id}`));
+                this.log('debug', `Attempting to acquire lock for task ${task.id}`);
                 if (!(await this.taskService.acquireTaskLock(task.id, workerId, 5))) {
                     console.log(chalk.yellow(`⚠️ [BotScheduler:Alarm] Could not acquire lock for task ${task.id}`));
+                    this.log('warn', `Could not acquire lock for task ${task.id}`);
                     continue;
                 }
                 console.log(chalk.blue(`✅ [BotScheduler:Alarm] Lock acquired for task ${task.id}`));
+                this.log('debug', `Lock acquired for task ${task.id}`);
 
                 let execution: BotTaskExecution | null = null;
                 try {
@@ -350,6 +487,7 @@ export class BotScheduler extends DurableObject {
                         const stats = await this.rateLimitService.getUsageStats(task.rate_limit_endpoint);
                         rateLimitRemaining = stats.limit - stats.current;
                         console.log(chalk.blue(`📊 [BotScheduler:Alarm] Initial rate limit for task ${task.id}: ${rateLimitRemaining}`));
+                        this.log('debug', `Initial rate limit for task ${task.id}: ${rateLimitRemaining}`);
                     }
 
                     const executionData = {
@@ -369,12 +507,17 @@ export class BotScheduler extends DurableObject {
                         error_stack: null
                     };
                     console.log(chalk.blue(`➕ [BotScheduler:Alarm] Creating execution record for task ${task.id} with data:`), executionData);
+                    this.log('debug', `Creating execution record for task ${task.id}`);
                     execution = await this.taskService.createTaskExecution(executionData);
                     console.log(chalk.blue(`✅ [BotScheduler:Alarm] Execution record ${execution.id} created for task ${task.id}`));
+                    this.log('debug', `Execution record ${execution.id} created for task ${task.id}`);
+                    this.notifyEntityUpdate('task_execution', 'created', execution.id);
 
                     console.log(chalk.blue(`▶️ [BotScheduler:Alarm] Executing task ${task.id} via handler`));
+                    this.log('debug', `Executing task ${task.id} via handler`);
                     await handler.execute(this.env, botId, task, execution, this.taskService);
                     console.log(chalk.green(`✅ [BotScheduler:Alarm] Handler execution complete for task ${task.id}`));
+                    this.log('debug', `Handler execution complete for task ${task.id}`);
 
                     if (execution) {
                         let updatedRateLimitRemaining = 0;
@@ -384,6 +527,7 @@ export class BotScheduler extends DurableObject {
 
                             updatedRateLimitRemaining = stats.limit - stats.current;
                             console.log(chalk.blue(`📊 [BotScheduler:Alarm] Updated rate limit for task ${task.id}: ${updatedRateLimitRemaining}`));
+                            this.log('debug', `Updated rate limit for task ${task.id}: ${updatedRateLimitRemaining}`);
                         }
 
                         const startedAt = new Date(execution.started_at);
@@ -396,21 +540,29 @@ export class BotScheduler extends DurableObject {
                             lock_expires_at: null
                         };
                         console.log(chalk.blue(`💾 [BotScheduler:Alarm] Updating execution ${execution.id} for task ${task.id} to completed with data:`), updateExecutionData);
+                        this.log('debug', `Updating execution ${execution.id} for task ${task.id} to completed.`);
                         await this.taskService.updateTaskExecution(execution.id, updateExecutionData);
                         console.log(chalk.blue(`✅ [BotScheduler:Alarm] Execution ${execution.id} updated for task ${task.id}`));
+                        this.log('debug', `Execution ${execution.id} updated for task ${task.id}`);
+                        this.notifyEntityUpdate('task_execution', 'updated', execution.id);
 
                         const updateTaskDefData = {
                             last_successful_run_at: new Date(),
                             next_planned_run_at: new Date(Date.now() + task.interval_minutes * 60 * 1000)
                         };
                         console.log(chalk.blue(`💾 [BotScheduler:Alarm] Updating task definition ${task.id} with data:`), updateTaskDefData);
+                        this.log('debug', `Updating task definition ${task.id} with next planned run.`);
                         await this.taskService.updateTaskDefinition(task.id, updateTaskDefData);
                         console.log(chalk.blue(`✅ [BotScheduler:Alarm] Task definition ${task.id} updated`));
+                        this.log('debug', `Task definition ${task.id} updated.`);
+                        this.notifyEntityUpdate('task_definition', 'updated', task.id);
                     }
 
                     console.log(chalk.green(`🏁 [BotScheduler:Alarm] Successfully completed processing for task ${task.id}`));
+                    this.log('info', `Successfully completed processing for task ${task.id}`);
                 } catch (error) {
                     console.log(chalk.red(`❌ [BotScheduler:Alarm] Error processing task ${task.id} (execution ID: ${execution?.id}):`), error);
+                    this.log('error', `Error processing task ${task.id} (execution ID: ${execution?.id}): ${error instanceof Error ? error.message : String(error)}`);
 
                     if (execution) {
                         let rateLimitRemainingOnError = 0;
@@ -419,6 +571,7 @@ export class BotScheduler extends DurableObject {
                             const stats = await this.rateLimitService.getUsageStats(task.rate_limit_endpoint);
                             rateLimitRemainingOnError = stats.limit - stats.current;
                             console.log(chalk.blue(`📊 [BotScheduler:Alarm] Rate limit on error for task ${task.id}: ${rateLimitRemainingOnError}`));
+                            this.log('debug', `Rate limit on error for task ${task.id}: ${rateLimitRemainingOnError}`);
                         }
 
                         // Ensure attempt_number is accurate if retrying from a previous execution
@@ -441,12 +594,17 @@ export class BotScheduler extends DurableObject {
                                 attempt_number: currentAttempt + 1 // Increment attempt number
                             };
                             console.log(chalk.yellow(`🔄 [BotScheduler:Alarm] Updating execution ${execution.id} for task ${task.id} to retrying with data:`), errorUpdateExecutionData);
+                            this.log('warn', `Updating execution ${execution.id} for task ${task.id} to retrying (attempt ${currentAttempt + 1}).`);
                             await this.taskService.updateTaskExecution(execution.id, errorUpdateExecutionData);
+                            this.notifyEntityUpdate('task_execution', 'updated', execution.id);
 
                             const retryTaskDefData = { next_planned_run_at: nextRetryTime };
                             console.log(chalk.yellow(`🔄 [BotScheduler:Alarm] Updating task definition ${task.id} for retry with data:`), retryTaskDefData);
+                            this.log('warn', `Updating task definition ${task.id} for retry at ${nextRetryTime.toISOString()}`);
                             await this.taskService.updateTaskDefinition(task.id, retryTaskDefData);
+                            this.notifyEntityUpdate('task_definition', 'updated', task.id);
                             console.log(chalk.yellow(`⏳ [BotScheduler:Alarm] Task ${task.id} will retry at ${nextRetryTime.toISOString()}`));
+                            this.log('warn', `Task ${task.id} will retry at ${nextRetryTime.toISOString()}`);
                         } else {
                             const failUpdateExecutionData = {
                                 status: 'failed' as TaskStatus,
@@ -459,32 +617,110 @@ export class BotScheduler extends DurableObject {
                                 error_stack: error instanceof Error ? error.stack || null : null
                             };
                             console.log(chalk.red(`🛑 [BotScheduler:Alarm] Updating execution ${execution.id} for task ${task.id} to failed with data:`), failUpdateExecutionData);
+                            this.log('error', `Updating execution ${execution.id} for task ${task.id} to failed.`);
                             await this.taskService.updateTaskExecution(execution.id, failUpdateExecutionData);
+                            this.notifyEntityUpdate('task_execution', 'updated', execution.id);
 
                             if (task.error_threshold) {
                                 console.log(chalk.blue(`📉 [BotScheduler:Alarm] Checking error threshold for task ${task.id} (threshold: ${task.error_threshold})`));
+                                this.log('debug', `Checking error threshold for task ${task.id} (threshold: ${task.error_threshold})`);
                                 const recentFailures = await this.taskService.getFailedTaskExecutionsByBot(botId, task.error_threshold);
                                 console.log(chalk.blue(`📉 [BotScheduler:Alarm] Found ${recentFailures.length} recent failures for bot ${botId}`));
+                                this.log('debug', `Found ${recentFailures.length} recent failures for bot ${botId}`);
                                 if (recentFailures.filter(f => f.task_definition_id === task.id).length >= task.error_threshold) {
                                     console.log(chalk.red(`⏸️ [BotScheduler:Alarm] Pausing task ${task.id} due to exceeding error threshold.`));
+                                    this.log('warn', `Pausing task ${task.id} due to exceeding error threshold.`);
                                     await this.taskService.updateTaskDefinition(task.id, { is_active: false });
+                                    this.notifyEntityUpdate('task_definition', 'updated', task.id);
                                 }
                             }
                             console.log(chalk.red(`🛑 [BotScheduler:Alarm] Task ${task.id} marked as failed after max retries.`));
+                            this.log('error', `Task ${task.id} marked as failed after max retries.`);
                         }
                     }
                 } finally {
                     console.log(chalk.blue(`🔓 [BotScheduler:Alarm] Releasing lock for task ${task.id}`));
+                    this.log('debug', `Releasing lock for task ${task.id}`);
                     await this.taskService.releaseTaskLock(task.id);
                     console.log(chalk.blue(`✅ [BotScheduler:Alarm] Lock released for task ${task.id}`));
+                    this.log('debug', `Lock released for task ${task.id}`);
                 }
             }
         } catch (error) {
             console.log(chalk.red('❌ [BotScheduler:Alarm] Unhandled error in alarm handler main try-catch:'), error);
+            this.log('error', `Unhandled error in alarm handler: ${error instanceof Error ? error.message : String(error)}`);
         } finally {
             console.log(chalk.blue(`⏭️ [BotScheduler:Alarm] Scheduling next alarm for bot ${botId}`));
+            this.log('debug', 'Scheduling next alarm (end of alarm handler).');
             await this.scheduleNextAlarm();
             console.log(chalk.blue(`✅ [BotScheduler:Alarm] Next alarm scheduling attempt complete for bot ${botId}`));
+            this.log('debug', 'Next alarm scheduling attempt complete.');
         }
+    }
+
+    private notifySchedulerStatusUpdate() {
+        if (!this.botId) return;
+        const message: SchedulerStatusUpdateMessage = {
+            type: 'scheduler_status_update',
+            botId: this.botId,
+            isRunning: this.isRunning,
+            currentAlarmTime: this.currentAlarmTime,
+            timestamp: Date.now(),
+        };
+        this.broadcast(message);
+        this.log('debug', `Sent scheduler status update: isRunning: ${this.isRunning}, alarmTime: ${this.currentAlarmTime}`);
+    }
+
+    private notifyEntityUpdate(entityType: EntityUpdateNotification['entityType'], action: EntityUpdateNotification['action'], entityId: string) {
+        if (!this.botId) return;
+        const message: EntityUpdateNotification = {
+            type: 'entity_update',
+            entityType,
+            action,
+            entityId,
+            botId: this.botId,
+            timestamp: Date.now(),
+        };
+        this.broadcast(message);
+        this.log('debug', `Sent entity update: ${entityType} ${action} for ID ${entityId}`);
+    }
+
+    // WebSocket Lifecycle Handlers
+    async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer) {
+        // Ensure botId is set before attempting to log or process
+        if (!this.botId) {
+            console.log(chalk.red('❌ [BotScheduler:webSocketMessage] Received message but botId is not set. Ignoring.'));
+            // Consider closing the WebSocket if this state is unexpected
+            // ws.close(1011, 'Bot not initialized'); 
+            return;
+        }
+        this.log('debug', `Received WebSocket message: ${typeof message === 'string' ? message : 'binary data'}`);
+        // Currently, the DO primarily sends. If UI needs to send control messages in the future,
+        // they would be handled here. For example:
+        // try {
+        //   const parsedMessage = JSON.parse(message as string);
+        //   if (parsedMessage.type === 'set_log_level') {
+        //     this.log('info', `Client requested log level change to: ${parsedMessage.level}`);
+        //     // (Logic to actually change log verbosity if implemented)
+        //   }
+        // } catch (e) {
+        //   this.log('error', 'Failed to parse client WebSocket message.');
+        // }
+    }
+
+    async webSocketClose(ws: WebSocket, code: number, reason: string, wasClean: boolean) {
+        if (!this.botId) {
+            console.log(chalk.red(`❌ [BotScheduler:webSocketClose] WebSocket closed (code ${code}, reason '${reason}', clean: ${wasClean}) but botId is not set.`));
+            return;
+        }
+        this.log('info', `WebSocket closed: code ${code}, reason '${reason}', wasClean ${wasClean}`);
+    }
+
+    async webSocketError(ws: WebSocket, error: any) {
+        if (!this.botId) {
+            console.log(chalk.red(`❌ [BotScheduler:webSocketError] WebSocket error (${error.toString()}) but botId is not set.`));
+            return;
+        }
+        this.log('error', `WebSocket error: ${error.toString()}`);
     }
 }

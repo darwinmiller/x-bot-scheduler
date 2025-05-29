@@ -24,7 +24,6 @@ export class ReplyTaskHandler extends BaseTaskHandler {
 
             const postReplyService = new PostReplyService(env.DB);
             const pulledPostRepository = new PulledPostRepository(env.DB);
-            const postReplyRepository = new PostReplyRepository(env.DB);
             const replies = await postReplyService.getUnsentAutoReplies();
             const twitterClient = await initializeTwitterClient(env, botId);
             let repliesSent = 0;
@@ -32,35 +31,52 @@ export class ReplyTaskHandler extends BaseTaskHandler {
             for (const reply of replies) {
                 console.log(chalk.green(`🔍 Sending reply ${reply.id}`));
                 const pulledPost = await pulledPostRepository.findById(reply.pulled_post_id);
-                const originalContent = JSON.parse(reply.original_content || '{}').content;
+
+                // Use edited_content if available, otherwise original_content
+                let contentToSend = reply.edited_content || reply.original_content;
+
                 if (!pulledPost) {
                     console.error(chalk.red(`❌ Pulled post not found for reply ${reply.id}`));
+                    repliesFailed++;
                     continue;
                 }
-                if (!originalContent) {
+                if (!contentToSend) {
                     console.error(chalk.red(`❌ Reply content not found for reply ${reply.id}, nothing to send`));
+                    repliesFailed++;
                     continue;
                 }
                 const createPostRequest = {
-                    text: originalContent,
+                    text: contentToSend,
                     reply: {
                         in_reply_to_tweet_id: pulledPost.twitter_post_id
                     }
                 };
 
-                const response = await twitterClient.posts.createPost(createPostRequest);
+                try {
+                    const twitterApiResponse = await twitterClient.posts.createPost(createPostRequest);
+                    const botTwitterReplyId = twitterApiResponse.data.id;
+                    const replySentAt = new Date();
 
-                await postReplyRepository.update(reply.id, {
-                    status: 'replied',
-                    reply_id: response.data.id,
-                    reply_created_at: new Date(),
-                    updated_by: 'bot_' + botId,
-                    approved_at: new Date()
-                });
-                if (response.data) {
-                    repliesSent++;
-                } else {
+                    await postReplyService.markReplyAsSentAndNotify(
+                        reply.id,
+                        botTwitterReplyId,
+                        replySentAt,
+                        botId, // Internal system botId
+                        `bot_${botId}` // updatedBy
+                    );
+
+                    if (twitterApiResponse.data) {
+                        repliesSent++;
+                    } else {
+                        // This case should ideally not be hit if createPost throws on failure or returns non-success
+                        console.warn(chalk.yellow(`⚠️ Reply sent for ${reply.id} but API response data was unexpected.`));
+                        repliesFailed++;
+                    }
+                } catch (sendError) {
+                    console.error(chalk.red(`❌ Failed to send reply ${reply.id} to Twitter or update status/notify:`), sendError);
                     repliesFailed++;
+                    // Optionally, update reply status to errored here if needed via postReplyService
+                    // For now, it just increments failed count and continues to next reply.
                 }
             }
 
