@@ -19,7 +19,6 @@ export class ReplyGenerationTaskHandler extends BaseTaskHandler {
      * @returns true if the task type is 'reply_generation'
      */
 
-    //TODO: fix this  LOL
     canHandle(task: BotTaskDefinition): boolean {
         return task.task_type === 'generate_replys';
     }
@@ -149,9 +148,8 @@ export class ReplyGenerationTaskHandler extends BaseTaskHandler {
                     } else {
                         // Handle cases where LLM generation itself might fail or return a non-complete status
                         console.error(chalk.red(`❌ LLM generation failed for reply ${reply.id} with status: ${result.status}. LLM Output: ${result.output}`));
-                        //TODO: add a status of failed to the post_reply generation_status
                         await postReplyRepository.update(reply.id, {
-                            generation_status: 'complete', // Or an appropriate error status
+                            generation_status: 'failed',
                             updated_by: 'bot_' + botId,
                             error_message: `LLM generation returned status: ${result.status}. Error: ${result.error_message || 'No error message'}`
                         });
@@ -162,9 +160,8 @@ export class ReplyGenerationTaskHandler extends BaseTaskHandler {
                     errorCount++;
                     // Update the specific reply to a failed status to avoid reprocessing indefinitely
                     try {
-                        //TODO: add a status of failed to the post_reply generation_status
                         await postReplyRepository.update(reply.id, {
-                            generation_status: 'complete',
+                            generation_status: 'failed',
                             updated_by: 'bot_' + botId,
                             error_message: error instanceof Error ? `Outer catch: ${error.message}` : 'Outer catch: Unknown error during reply processing'
                         });

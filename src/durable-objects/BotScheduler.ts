@@ -448,11 +448,12 @@ export class BotScheduler extends DurableObject {
         this.log('info', `Alarm triggered. Worker ID: ${workerId}`);
 
         try {
-            console.log(chalk.blue(`🧹 [BotScheduler:Alarm] Attempting to cleanup expired locks for bot ${botId}`));
-            this.log('debug', 'Attempting to cleanup expired locks.');
-            await this.taskService.cleanupExpiredLocks();
-            console.log(chalk.blue(`✅ [BotScheduler:Alarm] Expired locks cleanup complete for bot ${botId}`));
-            this.log('debug', 'Expired locks cleanup complete.');
+            //TODO: lock refactor
+            //  console.log(chalk.blue(`🧹 [BotScheduler:Alarm] Attempting to cleanup expired locks for bot ${botId}`));
+            //  this.log('debug', 'Attempting to cleanup expired locks.');
+            //  await this.taskService.cleanupExpiredLocks();
+            //  console.log(chalk.blue(`✅ [BotScheduler:Alarm] Expired locks cleanup complete for bot ${botId}`));
+            //  this.log('debug', 'Expired locks cleanup complete.');
 
             const dueTasks = await this.taskService.getDueTasksByBot(botId, new Date());
             console.log(chalk.blue(`📋 [BotScheduler:Alarm] Found ${dueTasks.length} due tasks for bot ${botId}:`), dueTasks.map(t => t.id));
@@ -469,15 +470,16 @@ export class BotScheduler extends DurableObject {
                     continue;
                 }
 
-                console.log(chalk.blue(`🔐 [BotScheduler:Alarm] Attempting to acquire lock for task ${task.id}`));
-                this.log('debug', `Attempting to acquire lock for task ${task.id}`);
-                if (!(await this.taskService.acquireTaskLock(task.id, workerId, 5))) {
-                    console.log(chalk.yellow(`⚠️ [BotScheduler:Alarm] Could not acquire lock for task ${task.id}`));
-                    this.log('warn', `Could not acquire lock for task ${task.id}`);
-                    continue;
-                }
-                console.log(chalk.blue(`✅ [BotScheduler:Alarm] Lock acquired for task ${task.id}`));
-                this.log('debug', `Lock acquired for task ${task.id}`);
+                //TODO: lock refactor
+                //  console.log(chalk.blue(`🔐 [BotScheduler:Alarm] Attempting to acquire lock for task ${task.id}`));
+                //  this.log('debug', `Attempting to acquire lock for task ${task.id}`);
+                //  if (!(await this.taskService.acquireTaskLock(task.id, workerId, 5))) {
+                //    console.log(chalk.yellow(`⚠️ [BotScheduler:Alarm] Could not acquire lock for task ${task.id}`));
+                //    this.log('warn', `Could not acquire lock for task ${task.id}`);
+                //    continue;
+                //}
+                //  console.log(chalk.blue(`✅ [BotScheduler:Alarm] Lock acquired for task ${task.id}`));
+                //  this.log('debug', `Lock acquired for task ${task.id}`);
 
                 let execution: BotTaskExecution | null = null;
                 try {
@@ -639,11 +641,12 @@ export class BotScheduler extends DurableObject {
                         }
                     }
                 } finally {
-                    console.log(chalk.blue(`🔓 [BotScheduler:Alarm] Releasing lock for task ${task.id}`));
-                    this.log('debug', `Releasing lock for task ${task.id}`);
-                    await this.taskService.releaseTaskLock(task.id);
-                    console.log(chalk.blue(`✅ [BotScheduler:Alarm] Lock released for task ${task.id}`));
-                    this.log('debug', `Lock released for task ${task.id}`);
+                    //TODO: lock refactor
+                    //  console.log(chalk.blue(`🔓 [BotScheduler:Alarm] Releasing lock for task ${task.id}`));
+                    //  this.log('debug', `Releasing lock for task ${task.id}`);
+                    //  await this.taskService.releaseTaskLock(task.id);
+                    //  console.log(chalk.blue(`✅ [BotScheduler:Alarm] Lock released for task ${task.id}`));
+                    //  this.log('debug', `Lock released for task ${task.id}`);
                 }
             }
         } catch (error) {
